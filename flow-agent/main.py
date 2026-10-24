@@ -13,6 +13,7 @@ import json
 import sys
 
 from flow_agent import EngineError, FlowEngine
+from flow_agent.image_models import ImageModelError
 
 engine = FlowEngine()
 
@@ -203,7 +204,7 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
-    except EngineError as exc:
+    except (EngineError, ImageModelError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

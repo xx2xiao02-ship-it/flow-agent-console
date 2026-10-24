@@ -40,8 +40,17 @@ output/
 **/.pytest-tmp/
 .pytest_cache/
 .pytest-tmp/
+.pytest-tmp*/
 
 # OS metadata
 .DS_Store
 **/.DS_Store
 *.zip
+graphify-out/
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo
+.npm-cache/
+.uv-cache/
+.pyinstaller-cache/
+.pytest_tmp/

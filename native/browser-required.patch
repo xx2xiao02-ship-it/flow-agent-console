@@ -1,0 +1,792 @@
+diff --git a/flow-go/internal/app/app.go b/flow-go/internal/app/app.go
+index 6a9eaaf..44be559 100644
+--- a/flow-go/internal/app/app.go
++++ b/flow-go/internal/app/app.go
+@@ -200,22 +200,26 @@ func (a *App) RunBridge(ctx context.Context) error {
+ 
+ 	// Bootstrap once a browser shows up, in the background, so a slow or absent
+ 	// browser never holds up the listener — which is the part that has to work.
+-	go func() {
+-		waitCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+-		defer cancel()
+-
+-		if err := a.Bridge.WaitForExtension(waitCtx, 60*time.Second); err != nil {
+-			log.Printf("app: %v — listening anyway; a bundle is written when one connects", err)
+-		}
+-
+-		bootCtx, bootCancel := context.WithTimeout(ctx, 60*time.Second)
+-		defer bootCancel()
+-		if err := a.Engine.Bootstrap(bootCtx); err != nil {
+-			log.Printf("app: engine bootstrap failed: %v", err)
+-			log.Printf("app: the bridge is still listening and still persisting bundles; " +
+-				"only the account and credit records are missing")
+-		}
+-	}()
++	if os.Getenv("FLOW_BRIDGE_SYNC_ONLY") != "1" {
++		go func() {
++			waitCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
++			defer cancel()
++
++			if err := a.Bridge.WaitForExtension(waitCtx, 60*time.Second); err != nil {
++				log.Printf("app: %v — listening anyway; a bundle is written when one connects", err)
++			}
++
++			bootCtx, bootCancel := context.WithTimeout(ctx, 60*time.Second)
++			defer bootCancel()
++			if err := a.Engine.Bootstrap(bootCtx); err != nil {
++				log.Printf("app: engine bootstrap failed: %v", err)
++				log.Printf("app: the bridge is still listening and still persisting bundles; " +
++					"only the account and credit records are missing")
++			}
++		}()
++	} else {
++		log.Print("app: passive console bridge; no engine bootstrap or page opening")
++	}
+ 
+ 	select {
+ 	case err := <-bridgeErr:
+diff --git a/flow-go/internal/batchexecute/client.go b/flow-go/internal/batchexecute/client.go
+index 2e4c01a..6be5e45 100644
+--- a/flow-go/internal/batchexecute/client.go
++++ b/flow-go/internal/batchexecute/client.go
+@@ -27,6 +27,7 @@ import (
+ 	"fmt"
+ 	"log"
+ 	"net/url"
++	"os"
+ 	"regexp"
+ 	"strconv"
+ 	"strings"
+@@ -377,6 +378,8 @@ type Client struct {
+ 	// sessionID is the `f.sid` the app sends on every batchexecute request. It
+ 	// comes from the page and is inherited by calls that do not name their own.
+ 	sessionID string
++	// Live page build for the console's pinned browser, overriding stale defaults.
++	pageBuildLabel string
+ 	// fp is the identity to present. Zero value means "generic Chrome".
+ 	fp Fingerprint
+ 	// overrides are extra headers applied last. A header mapped to "" is
+@@ -522,6 +525,21 @@ func (c *Client) SetSessionID(id string) {
+ 	c.mu.Unlock()
+ }
+ 
++func (c *Client) SetPageBuildLabel(label string) {
++	c.mu.Lock()
++	c.pageBuildLabel = label
++	c.mu.Unlock()
++}
++
++func (c *Client) buildLabelFor(opts CallOptions) string {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.pageBuildLabel != "" {
++		return c.pageBuildLabel
++	}
++	return opts.BuildLabel
++}
++
+ // ResolvedHeaders reports the headers and Cookie value a call would go out
+ // with, for comparing against the browser's own request. Diagnostics only.
+ func (c *Client) ResolvedHeaders() (map[string]string, string) {
+@@ -841,8 +859,8 @@ func (c *Client) call(ctx context.Context, rpcID string, opts CallOptions,
+ 	query.Set("hl", "en")
+ 	query.Set("rt", "c")
+ 	query.Set("_reqid", strconv.FormatInt(reqID, 10))
+-	if opts.BuildLabel != "" {
+-		query.Set("bl", opts.BuildLabel)
++	if label := c.buildLabelFor(opts); label != "" {
++		query.Set("bl", label)
+ 	}
+ 	if sid := c.sessionIDFor(opts); sid != "" {
+ 		query.Set("f.sid", sid)
+@@ -1052,6 +1070,15 @@ func (c *Client) post(ctx context.Context, rpcID string,
+ 			// supply the header order as well as the headers — and neither made
+ 			// any difference to that rejection. The setters went with the
+ 			// upscale code; the values are what they always resolved to.
++			if submissionRPCs[rpcID] {
++				if os.Getenv("FLOW_BLOCK_GENERATION") == "1" {
++					return nil, fmt.Errorf("GENERATION_BLOCKED: read-only browser diagnostic")
++				}
++				if os.Getenv("FLOW_NO_SUBMISSION_REPLAY") == "1" && sent > 1 {
++					return nil, fmt.Errorf("GENERATION_REPLAY_BLOCKED: no second submission sent")
++				}
++				log.Printf("browser-generation: sending rpc=%s attempt=%d", rpcID, sent)
++			}
+ 			resp, err := c.hc.Do(ctx, &httpx.Request{
+ 				Method:      "POST",
+ 				URL:         fullURL,
+@@ -1274,7 +1301,18 @@ func (c *Client) GenerateMedia(ctx context.Context, req GenerateRequest, opts Ca
+ 	if frames, err = retryIfEmpty(ctx, opts, frames, carriesNoMedia, submit); err != nil {
+ 		return nil, err
+ 	}
+-	return parseMediaFrames(frames), nil
++	media := parseMediaFrames(frames)
++	if len(media) == 0 && os.Getenv("FLOW_NO_SUBMISSION_REPLAY") == "1" {
++		return nil, &EmptyMediaError{Frames: len(frames)}
++	}
++	return media, nil
++}
++
++// EmptyMediaError retains the real frame count without inventing a refusal.
++type EmptyMediaError struct{ Frames int }
++
++func (e *EmptyMediaError) Error() string {
++	return fmt.Sprintf("batchexecute: %d response frame(s) contained no media; no replay sent", e.Frames)
+ }
+ 
+ // retryIfEmpty resubmits a generation that Flow accepted and answered with
+@@ -1313,6 +1351,19 @@ func retryIfEmpty(ctx context.Context, opts CallOptions, frames []Frame,
+ 	empty func([]Frame) bool,
+ 	submit func(token string) ([]Frame, error)) ([]Frame, error) {
+ 
++	if os.Getenv("FLOW_NO_SUBMISSION_REPLAY") == "1" {
++		// No replay must not mean no diagnosis. The old early return discarded
++		// the server's ErrorInfo and turned every refusal into EMPTY_RESULT.
++		if empty(frames) {
++			if reason := UpstreamError(frames); reason != "" {
++				if IsUnusualActivity(reason) && opts.NoteUnusualActivity != nil {
++					opts.NoteUnusualActivity()
++				}
++				return frames, &RejectedError{Reason: reason, Frames: len(frames)}
++			}
++		}
++		return frames, nil
++	}
+ 	if opts.RefreshCaptcha == nil || !empty(frames) {
+ 		return frames, nil
+ 	}
+diff --git a/flow-go/internal/batchexecute/console_browser_test.go b/flow-go/internal/batchexecute/console_browser_test.go
+new file mode 100644
+index 0000000..377d18e
+--- /dev/null
++++ b/flow-go/internal/batchexecute/console_browser_test.go
+@@ -0,0 +1,92 @@
++package batchexecute
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++)
++
++func TestConsoleNeverReplaysEmptyGeneration(t *testing.T) {
++	t.Setenv("FLOW_NO_SUBMISSION_REPLAY", "1")
++	server, requests := generationServer(t, RPCIDGenerate, emptyPayload, assetPayload())
++	pointAt(t, server)
++	minted := 0
++	_, err := testClient(t).GenerateMedia(context.Background(), imageRequest("token-0"), CallOptions{RefreshCaptcha: refresher(&minted)})
++	var empty *EmptyMediaError
++	if !errors.As(err, &empty) || empty.Frames != 1 {
++		t.Fatalf("lost frame count: %v", err)
++	}
++	if len(*requests) != 1 || minted != 0 {
++		t.Fatalf("sent=%d refreshed=%d", len(*requests), minted)
++	}
++}
++
++func TestConsoleNoReplayStillReportsFirstResponseRefusal(t *testing.T) {
++	t.Setenv("FLOW_NO_SUBMISSION_REPLAY", "1")
++	for _, reason := range []string{ReasonUnusualActivity, "PUBLIC_ERROR_PERMISSION_DENIED"} {
++		t.Run(reason, func(t *testing.T) {
++			requests := 0
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				requests++
++				fmt.Fprint(w, strings.ReplaceAll(liveRefusal, ReasonUnusualActivity, reason))
++			}))
++			t.Cleanup(server.Close)
++			pointAt(t, server)
++			minted, noted := 0, 0
++			_, err := testClient(t).GenerateMedia(context.Background(), imageRequest("token-0"), CallOptions{
++				RefreshCaptcha: refresher(&minted), NoteUnusualActivity: func() { noted++ },
++			})
++			var rejected *RejectedError
++			if !errors.As(err, &rejected) || rejected.Reason != reason || rejected.Frames != 1 || requests != 1 || minted != 0 {
++				t.Fatalf("err=%v sent=%d minted=%d", err, requests, minted)
++			}
++			if IsUnusualActivity(reason) && noted != 1 {
++				t.Fatal("assessment refusal not recorded")
++			}
++		})
++	}
++}
++
++func TestLivePageBuildOverridesStaleCallBuild(t *testing.T) {
++	c := testClient(t)
++	if c.buildLabelFor(CallOptions{BuildLabel: "legacy"}) != "legacy" {
++		t.Fatal("legacy CLI changed")
++	}
++	c.SetPageBuildLabel("boq_labs-ai-sandbox-frontend_20261016.00_p1")
++	if c.buildLabelFor(CallOptions{BuildLabel: "legacy"}) != "boq_labs-ai-sandbox-frontend_20261016.00_p1" {
++		t.Fatal("live page build ignored")
++	}
++}
++func TestConsoleNeverReplaysAfterPriming(t *testing.T) {
++	t.Setenv("FLOW_NO_SUBMISSION_REPLAY", "1")
++	server, requests := primingServer(t)
++	pointAt(t, server)
++	_, err := testClient(t).Generate(context.Background(), imageRequest("token-0"), CallOptions{})
++	if err == nil || !strings.Contains(err.Error(), "GENERATION_REPLAY_BLOCKED") || len(*requests) != 1 {
++		t.Fatalf("sent=%d err=%v", len(*requests), err)
++	}
++}
++func TestReadOnlyBrowserCheckBlocksEveryGenerationSend(t *testing.T) {
++	t.Setenv("FLOW_BLOCK_GENERATION", "1")
++	server, requests := generationServer(t, RPCIDGenerate, assetPayload())
++	pointAt(t, server)
++	_, err := testClient(t).GenerateMedia(context.Background(), imageRequest("token-0"), CallOptions{})
++	if err == nil || !strings.Contains(err.Error(), "GENERATION_BLOCKED") || len(*requests) != 0 {
++		t.Fatalf("sent=%d err=%v", len(*requests), err)
++	}
++}
++func TestConsolePreservesSuccessfulBelugaPayload(t *testing.T) {
++	t.Setenv("FLOW_NO_SUBMISSION_REPLAY", "1")
++	server, requests := generationServer(t, RPCIDGenerate, assetPayload())
++	pointAt(t, server)
++	req := imageRequest("token-0")
++	req.Model = "BELUGA"
++	media, err := testClient(t).GenerateMedia(context.Background(), req, CallOptions{})
++	if err != nil || len(media) != 1 || len(*requests) != 1 || !strings.Contains((*requests)[0], "BELUGA") {
++		t.Fatalf("media=%d sent=%d err=%v", len(media), len(*requests), err)
++	}
++}
+diff --git a/flow-go/internal/bridge/bridge.go b/flow-go/internal/bridge/bridge.go
+index 054b8b8..ae77d28 100644
+--- a/flow-go/internal/bridge/bridge.go
++++ b/flow-go/internal/bridge/bridge.go
+@@ -70,9 +70,11 @@ type Bridge struct {
+ 	// BlockedMethods is the CDP deny-list handed to the extension.
+ 	BlockedMethods []string
+ 
+-	mu      sync.RWMutex
+-	clients map[string]*cdp.Client
+-	current *cdp.Client
++	mu            sync.RWMutex
++	clients       map[string]*cdp.Client
++	current       *cdp.Client
++	consolePinned bool
++	consoleClient *cdp.Client
+ 
+ 	// lastJar is the most recent cookie set pulled from the browser.
+ 	lastJar *cookiejar.Jar
+@@ -642,6 +644,9 @@ func (b *Bridge) firstPersistedJar() *cookiejar.Jar {
+ func (b *Bridge) Current() *cdp.Client {
+ 	b.mu.RLock()
+ 	defer b.mu.RUnlock()
++	if b.consolePinned {
++		return b.consoleClient
++	}
+ 	return b.current
+ }
+ 
+diff --git a/flow-go/internal/bridge/console_browser.go b/flow-go/internal/bridge/console_browser.go
+new file mode 100644
+index 0000000..7904889
+--- /dev/null
++++ b/flow-go/internal/bridge/console_browser.go
+@@ -0,0 +1,61 @@
++package bridge
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"sort"
++	"time"
++
++	"github.com/kodelyx/flow-go/flow-go/internal/cdp"
++	"github.com/kodelyx/flow-go/flow-go/internal/cookiejar"
++)
++
++// PinAccount binds browser operations to the exact cookie identity requested by
++// the caller. Later connections and disconnects must never select another user.
++func (b *Bridge) PinAccount(ctx context.Context, key string) (*cdp.Client, error) {
++	if key == "" {
++		return nil, fmt.Errorf("BROWSER_ACCOUNT_MISSING")
++	}
++	b.mu.Lock()
++	b.consolePinned = true
++	b.consoleClient = nil
++	b.mu.Unlock()
++	for {
++		clients := b.Clients()
++		addresses := make([]string, 0, len(clients))
++		for address := range clients {
++			addresses = append(addresses, address)
++		}
++		sort.Strings(addresses)
++		for _, address := range addresses {
++			client := clients[address]
++			if !client.ProbeSurface().FlowOperations {
++				continue
++			}
++			readCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
++			cookies, err := client.ListCookies(readCtx, map[string]any{"domain": "google.com"})
++			cancel()
++			if err != nil {
++				continue
++			}
++			raw, _ := json.Marshal(cookies)
++			var converted []cookiejar.Cookie
++			if json.Unmarshal(raw, &converted) != nil {
++				continue
++			}
++			if cookiejar.AccountKey(cookiejar.FromCookies(converted, "browser-check")) != key {
++				continue
++			}
++			b.mu.Lock()
++			b.consoleClient = client
++			b.mu.Unlock()
++			return client, nil
++		}
++		select {
++		case <-ctx.Done():
++			return nil, fmt.Errorf("BROWSER_ACCOUNT_NOT_CONNECTED: selected account browser is unavailable")
++		case <-time.After(250 * time.Millisecond):
++		}
++	}
++}
+diff --git a/flow-go/internal/bridge/console_browser_test.go b/flow-go/internal/bridge/console_browser_test.go
+new file mode 100644
+index 0000000..60fa874
+--- /dev/null
++++ b/flow-go/internal/bridge/console_browser_test.go
+@@ -0,0 +1,81 @@
++package bridge
++
++import (
++	"context"
++	"github.com/gorilla/websocket"
++	"github.com/kodelyx/flow-go/flow-go/internal/cdp"
++	"github.com/kodelyx/flow-go/flow-go/internal/cookiejar"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++)
++
++func consolePeer(t *testing.T, value string) *cdp.Client {
++	t.Helper()
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		socket, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
++		if err != nil {
++			return
++		}
++		defer socket.Close()
++		for {
++			var request struct {
++				ID string `json:"id"`
++				Op string `json:"op"`
++			}
++			if socket.ReadJSON(&request) != nil {
++				return
++			}
++			var result any = map[string]any{"ok": true, "version": "1.0.4", "ops": []string{"flow.captcha", "cookies.list"}}
++			if request.Op == "cookies.list" {
++				result = []cookiejar.Cookie{{Name: "SAPISID", Value: value, Domain: ".google.com", Path: "/"}}
++			}
++			if socket.WriteJSON(map[string]any{"id": request.ID, "result": result}) != nil {
++				return
++			}
++		}
++	}))
++	t.Cleanup(server.Close)
++	client, err := cdp.Dial(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { client.Close() })
++	return client
++}
++func TestConsolePinsExactAccountDespiteLaterProfileConnection(t *testing.T) {
++	b := newTestBridge(t)
++	first := consolePeer(t, "first")
++	other := consolePeer(t, "other")
++	b.add(first)
++	b.add(other)
++	expected := cookiejar.AccountKey(cookiejar.FromCookies([]cookiejar.Cookie{{Name: "SAPISID", Value: "first"}}, "test"))
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	selected, err := b.PinAccount(ctx, expected)
++	if err != nil || selected != first {
++		t.Fatalf("wrong account: %v", err)
++	}
++	b.add(other)
++	if b.Current() != first {
++		t.Fatal("a later profile replaced the requested account")
++	}
++	first.Close()
++	if b.Connected() {
++		t.Fatal("disconnect must not fall back to another account")
++	}
++}
++func TestConsoleRejectsMissingSelectedAccount(t *testing.T) {
++	b := newTestBridge(t)
++	b.add(consolePeer(t, "other"))
++	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
++	defer cancel()
++	if _, err := b.PinAccount(ctx, "missing"); err == nil {
++		t.Fatal("mismatched browser accepted")
++	}
++	if b.Current() != nil {
++		t.Fatal("wrong profile remains selected")
++	}
++}
+diff --git a/flow-go/internal/cli/browser_check.go b/flow-go/internal/cli/browser_check.go
+new file mode 100644
+index 0000000..1449d05
+--- /dev/null
++++ b/flow-go/internal/cli/browser_check.go
+@@ -0,0 +1,50 @@
++package cli
++
++import (
++	"context"
++	"encoding/json"
++	"flag"
++	"fmt"
++	"os"
++	"time"
++)
++
++// runBrowserCheck follows the generation bootstrap and only probes whether the
++// page has its own verification client. No token mint or generation is invoked.
++func runBrowserCheck(args []string) int {
++	fs := flag.NewFlagSet("browser-check", flag.ContinueOnError)
++	var common commonFlags
++	common.bind(fs)
++	if err := fs.Parse(args); err != nil {
++		return 2
++	}
++	common.captcha = "browser"
++	a, err := common.build()
++	if err != nil {
++		return fail(err)
++	}
++	defer a.Close()
++	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
++	defer cancel()
++	attachBridgeWithin(ctx, a, bridgeAttachWindow, true)
++	if err = a.Engine.Bootstrap(ctx); err != nil {
++		return fail(err)
++	}
++	// Use the same account-bound current connection as the strict provider.
++	client := a.Bridge.Current()
++	if client == nil || !client.Connected() {
++		return fail(fmt.Errorf("BROWSER_ACCOUNT_NOT_CONNECTED"))
++	}
++	probe, err := client.FlowCaptcha(ctx, "", "")
++	if err != nil {
++		return fail(fmt.Errorf("BROWSER_PAGE_NOT_READY"))
++	}
++	if probe.Error == "BROWSER_VERIFICATION_PROTECTED" {
++		return fail(fmt.Errorf("BROWSER_VERIFICATION_PROTECTED: official public client blocks external execution; no token or generation requested"))
++	}
++	if !probe.Available {
++		return fail(fmt.Errorf("BROWSER_PAGE_NOT_READY: verification client absent; no generation submitted"))
++	}
++	json.NewEncoder(os.Stdout).Encode(map[string]any{"browser_connected": true, "account_id": a.Engine.AccountID(), "captcha_provider": "flow.captcha", "verification_client_loaded": true, "token_minted": false, "generation_submitted": false})
++	return 0
++}
+diff --git a/flow-go/internal/cli/cli.go b/flow-go/internal/cli/cli.go
+index d27343d..a3c4a13 100644
+--- a/flow-go/internal/cli/cli.go
++++ b/flow-go/internal/cli/cli.go
+@@ -65,6 +65,8 @@ func Run(args []string) int {
+ 		return runStats(args[1:])
+ 	case "balance", "credits":
+ 		return runBalance(args[1:])
++	case "browser-check":
++		return runBrowserCheck(args[1:])
+ 	case "doctor":
+ 		return runDoctor(args[1:])
+ 	case "export":
+diff --git a/flow-go/internal/engine/console_browser.go b/flow-go/internal/engine/console_browser.go
+new file mode 100644
+index 0000000..db6f179
+--- /dev/null
++++ b/flow-go/internal/engine/console_browser.go
+@@ -0,0 +1,99 @@
++package engine
++
++import (
++	"context"
++	"fmt"
++	"log"
++	"net/url"
++	"regexp"
++	"time"
++
++	"github.com/kodelyx/flow-go/flow-go/internal/cdp"
++	"github.com/kodelyx/flow-go/flow-go/internal/cookiejar"
++)
++
++// Only the actionless bridge probe is permitted here. Respect the public
++// client's protection and return before Bootstrap can reach token acquisition.
++func waitConsoleCaptcha(ctx context.Context, probe func(context.Context) (*cdp.FlowCaptchaResult, error)) error {
++	for {
++		result, err := probe(ctx)
++		if err == nil && result != nil && result.Error == "BROWSER_VERIFICATION_PROTECTED" {
++			return fmt.Errorf("BROWSER_VERIFICATION_PROTECTED: official public client blocks external execution; no token or generation requested")
++		}
++		if err == nil && result != nil && result.Available {
++			return nil
++		}
++		select {
++		case <-ctx.Done():
++			return fmt.Errorf("BROWSER_PAGE_NOT_READY: login or manual verification may be required")
++		case <-time.After(500 * time.Millisecond):
++		}
++	}
++}
++
++func (e *Engine) requireConsoleBrowser(ctx context.Context) error {
++	if e.opts.CookieFile == "" || e.bridge == nil {
++		return fmt.Errorf("BROWSER_ACCOUNT_MISSING: an explicit account is required")
++	}
++	jar, err := cookiejar.LoadFile(e.opts.CookieFile)
++	if err != nil {
++		return fmt.Errorf("BROWSER_ACCOUNT_MISSING: account file unavailable")
++	}
++	wait, cancel := context.WithTimeout(ctx, 35*time.Second)
++	defer cancel()
++	client, err := e.bridge.PinAccount(wait, cookiejar.AccountKey(jar))
++	if err != nil {
++		return err
++	}
++	supported := false
++	for _, op := range client.Surface().Advertised {
++		if op == "flow.consoleScope" {
++			supported = true
++		}
++	}
++	if !supported {
++		return fmt.Errorf("BROWSER_EXTENSION_UPDATE_REQUIRED: reload Flow Bridge")
++	}
++	var scope struct {
++		Owned bool `json:"owned"`
++	}
++	if err = client.Call(wait, "flow.consoleScope", map[string]any{}, &scope); err != nil || !scope.Owned {
++		return fmt.Errorf("BROWSER_OWNED_TAB_MISSING")
++	}
++	synced, err := e.bridge.SyncCookies(wait, client)
++	if err != nil || cookiejar.AccountKey(synced) != cookiejar.AccountKey(jar) {
++		return fmt.Errorf("BROWSER_ACCOUNT_CHANGED: selected browser identity changed")
++	}
++	bundle, err := cookiejar.LoadBundleFile(e.opts.CookieFile)
++	if err != nil || bundle.ProjectID == "" {
++		return fmt.Errorf("BROWSER_PROJECT_MISSING")
++	}
++	if _, err = client.Attach(wait, 0); err != nil {
++		return fmt.Errorf("BROWSER_PAGE_NOT_READY")
++	}
++	if err = client.FlowNavigate(wait, "https://flow.google.com/project/"+url.PathEscape(bundle.ProjectID), ""); err != nil {
++		return fmt.Errorf("BROWSER_PAGE_NOT_READY")
++	}
++	if err = waitConsoleCaptcha(wait, func(ctx context.Context) (*cdp.FlowCaptchaResult, error) {
++		return client.FlowCaptcha(ctx, "", "")
++	}); err != nil {
++		return err
++	}
++	synced, err = e.bridge.SyncCookies(wait, client)
++	if err != nil || cookiejar.AccountKey(synced) != cookiejar.AccountKey(jar) {
++		return fmt.Errorf("BROWSER_ACCOUNT_CHANGED")
++	}
++	var page struct {
++		BuildLabel string `json:"buildLabel"`
++	}
++	if err = client.Call(wait, "flow.at", map[string]any{}, &page); err != nil ||
++		!regexp.MustCompile(`^boq_labs-ai-sandbox-frontend_[A-Za-z0-9._-]+$`).MatchString(page.BuildLabel) {
++		return fmt.Errorf("BROWSER_EXTENSION_UPDATE_REQUIRED: live page build unavailable")
++	}
++	e.mu.Lock()
++	e.consoleBuildLabel = page.BuildLabel
++	e.mu.Unlock()
++	log.Printf("browser-required: using live page build %s", page.BuildLabel)
++	log.Printf("browser-required: selected account extension pinned; HTTP captcha fallback disabled")
++	return nil
++}
+diff --git a/flow-go/internal/engine/console_browser_test.go b/flow-go/internal/engine/console_browser_test.go
+new file mode 100644
+index 0000000..ec57bea
+--- /dev/null
++++ b/flow-go/internal/engine/console_browser_test.go
+@@ -0,0 +1,47 @@
++package engine
++
++import (
++	"context"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/kodelyx/flow-go/flow-go/internal/cdp"
++)
++
++func TestConsoleCaptchaStopsAtOfficialProtection(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	calls := 0
++	err := waitConsoleCaptcha(ctx, func(context.Context) (*cdp.FlowCaptchaResult, error) {
++		calls++
++		// Protection takes priority even if an older peer also reports available.
++		return &cdp.FlowCaptchaResult{Available: true, Error: "BROWSER_VERIFICATION_PROTECTED"}, nil
++	})
++	if err == nil || !strings.Contains(err.Error(), "BROWSER_VERIFICATION_PROTECTED") {
++		t.Fatalf("expected explicit protection failure, got %v", err)
++	}
++	if calls != 1 {
++		t.Fatalf("protected page must not be retried, got %d probes", calls)
++	}
++}
++
++func TestConsoleCaptchaUnavailableDoesNotPassBootstrap(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	err := waitConsoleCaptcha(ctx, func(context.Context) (*cdp.FlowCaptchaResult, error) {
++		return &cdp.FlowCaptchaResult{}, nil
++	})
++	if err == nil || !strings.Contains(err.Error(), "BROWSER_PAGE_NOT_READY") {
++		t.Fatalf("expected unavailable failure, got %v", err)
++	}
++}
++
++func TestConsoleCaptchaLoadedUnprotectedProbe(t *testing.T) {
++	err := waitConsoleCaptcha(context.Background(), func(context.Context) (*cdp.FlowCaptchaResult, error) {
++		return &cdp.FlowCaptchaResult{Available: true}, nil
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++}
+diff --git a/flow-go/internal/engine/engine.go b/flow-go/internal/engine/engine.go
+index a513724..2f8c1f2 100644
+--- a/flow-go/internal/engine/engine.go
++++ b/flow-go/internal/engine/engine.go
+@@ -173,7 +173,8 @@ type Engine struct {
+ 	// fsid is the page's `f.sid`, which the app sends on every batchexecute
+ 	// request. Read once at start-up and inherited by every client, because a
+ 	// call that omits it is a call the app would never have made.
+-	fsid string
++	fsid              string
++	consoleBuildLabel string
+ 	// hasSession records whether a Labs session was minted at boot. The bearer
+ 	// path needs one and the cookie-authenticated path does not, so the engine
+ 	// comes up either way; this says which of the two is actually available,
+@@ -316,10 +317,12 @@ func (e *Engine) newBatchexecuteClient(jar *cookiejar.Jar, hc *httpx.Client) *ba
+ 	e.mu.RLock()
+ 	fp := e.fingerprint
+ 	index := e.accountIndex
++	pageBuildLabel := e.consoleBuildLabel
+ 	e.mu.RUnlock()
+ 
+ 	// Account selection is a query parameter, so every client has to carry it.
+ 	client.SetAuthUser(index)
++	client.SetPageBuildLabel(pageBuildLabel)
+ 
+ 	// Pace the calls that spend credits, and only those.
+ 	//
+@@ -1158,6 +1161,11 @@ func (e *Engine) captchaEscalation(action string) func(ctx context.Context) (str
+ // re-registers the worker, which is how a re-synced browser session is picked up
+ // without restarting the process.
+ func (e *Engine) Bootstrap(ctx context.Context) error {
++	if strings.EqualFold(e.opts.CaptchaMode, "browser") {
++		if err := e.requireConsoleBrowser(ctx); err != nil {
++			return err
++		}
++	}
+ 	jar, source, err := e.loadJar(ctx)
+ 	if err != nil {
+ 		e.setError(err)
+@@ -2375,7 +2383,7 @@ func truncate(value string, max int) string {
+ // Only `broker` does. The default mints server-side, which is why a generation
+ // no longer has to have a Flow tab open anywhere.
+ func (e *Engine) captchaNeedsPage() bool {
+-	return strings.EqualFold(strings.TrimSpace(e.opts.CaptchaMode), "broker")
++	return strings.EqualFold(strings.TrimSpace(e.opts.CaptchaMode), "broker") || strings.EqualFold(strings.TrimSpace(e.opts.CaptchaMode), "browser")
+ }
+ 
+ // ensureProjectTab makes sure the browser is on a Flow editor before a
+@@ -4616,6 +4624,7 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
+ 
+ 	var media []batchexecute.GeneratedMedia
+ 	var rejected *batchexecute.RejectedError
++	var emptyMedia *batchexecute.EmptyMediaError
+ 
+ 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+ 		// A fresh token per attempt. The page mints one per generation, and the value
+@@ -4639,7 +4648,8 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
+ 		}))
+ 
+ 		rejected = nil
+-		if err != nil && !errors.As(err, &rejected) {
++		emptyMedia = nil
++		if err != nil && !errors.As(err, &rejected) && !errors.As(err, &emptyMedia) {
+ 			e.finishJob(jobID, "failed", nil, start, err, accountID)
+ 			_ = e.store.RecordAccountOutcome(e.AccountID(), true, err.Error())
+ 			return nil, err
+@@ -4724,6 +4734,8 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
+ 		frames := 0
+ 		if rejected != nil {
+ 			reason, frames = rejected.Reason, rejected.Frames
++		} else if emptyMedia != nil {
++			frames = emptyMedia.Frames
+ 		}
+ 		outcome.Status = "empty"
+ 		emptyErr = &EmptyResultError{
+@@ -4752,8 +4764,10 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
+ 	}
+ 
+ 	outcome.ElapsedS = time.Since(start).Seconds()
+-	e.finishJob(jobID, outcome.Status, nil, start, nil, accountID)
+-	_ = e.store.RecordAccountOutcome(e.AccountID(), false, "")
++	e.finishJob(jobID, outcome.Status, nil, start, emptyErr, accountID)
++	if emptyErr == nil {
++		_ = e.store.RecordAccountOutcome(e.AccountID(), false, "")
++	}
+ 
+ 	log.Printf("engine: generated %d image(s) in %.1fs", len(media), outcome.ElapsedS)
+ 	return outcome, emptyErr
+diff --git a/flow-go/internal/recaptcha/console_browser_test.go b/flow-go/internal/recaptcha/console_browser_test.go
+new file mode 100644
+index 0000000..4bc7665
+--- /dev/null
++++ b/flow-go/internal/recaptcha/console_browser_test.go
+@@ -0,0 +1,18 @@
++package recaptcha
++
++import (
++	"context"
++	"github.com/kodelyx/flow-go/flow-go/internal/cdp"
++	"testing"
++)
++
++func TestConsoleBrowserNeverFallsBackToHTTPOrEmpty(t *testing.T) {
++	p := Build("browser", nil, nil, nil, func() *cdp.Client { return nil }, "")
++	if p.Name() != "chain(flow.captcha)" {
++		t.Fatalf("unexpected providers: %s", p.Name())
++	}
++	token, err := p.Token(context.Background(), ActionImage)
++	if err == nil || token != "" {
++		t.Fatal("a missing browser must fail before submission")
++	}
++}
+diff --git a/flow-go/internal/recaptcha/recaptcha.go b/flow-go/internal/recaptcha/recaptcha.go
+index da43a7e..8a79aeb 100644
+--- a/flow-go/internal/recaptcha/recaptcha.go
++++ b/flow-go/internal/recaptcha/recaptcha.go
+@@ -669,6 +669,10 @@ func Build(mode string, hc *httpx.Client, broker *cdp.Client, pageURL PageURLRes
+ 		return EmptyProvider{}
+ 	case "http":
+ 		return NewChain(NewHTTP(hc, "", "").WithUserAgent(userAgent), EmptyProvider{})
++	case "browser":
++		// Strict local-console mode: a real account-bound page or an error.
++		// Never use HTTP/empty providers or inject scripts as a fallback.
++		return NewChain(NewFlow(current))
+ 	case "broker":
+ 		// The explicit opt-in to the browser. Kept because it is the only path
+ 		// that scores from a real page, and because a caller who asks for it

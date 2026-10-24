@@ -35,6 +35,7 @@
  */
 
 import { loadConfig, saveConfig, resetConfig, urlAllowed, domainAllowed } from './config.js';
+import { startPreparationPages } from './preparation-pages.js';
 
 const PROTOCOL_VERSION = 1;
 
@@ -55,6 +56,7 @@ let config = null;
 // `attachedTabId` can move on to one of the user's tabs while ours is still
 // open, and ours should still be reclaimed.
 let autoCreatedTabId = null;
+let preparationPages = null;
 
 // How many operations are being handled right now.
 //
@@ -237,7 +239,8 @@ const shapeCookie = (c) => ({
 async function listScopedTabs() {
   const cfg = await ensureConfig();
   const tabs = await chrome.tabs.query({});
-  return tabs.filter((t) => urlAllowed(t.url, cfg));
+  const owned = await preparationPages?.scopedTabIds?.();
+  return tabs.filter((t) => urlAllowed(t.url, cfg) && (!owned || owned.includes(t.id)));
 }
 
 /**
@@ -248,9 +251,10 @@ async function listScopedTabs() {
  * read that created tabs as a side effect would be the worst kind of surprise.
  */
 async function currentScopedTab() {
+  const owned = await preparationPages?.scopedTabIds?.();
   if (attachedTabId !== null) {
     const tab = await chrome.tabs.get(attachedTabId).catch(() => null);
-    if (tab) return tab;
+    if (tab && (!owned || owned.includes(tab.id))) return tab;
   }
   const scoped = await listScopedTabs();
   return scoped.length > 0 ? scoped[0] : null;
@@ -284,8 +288,9 @@ async function currentScopedTab() {
  */
 async function resolveTab(tabId = null) {
   if (tabId) {
+    const owned = await preparationPages?.scopedTabIds?.();
     const tab = await chrome.tabs.get(tabId).catch(() => null);
-    if (tab && urlAllowed(tab.url, await ensureConfig())) return tab;
+    if (tab && urlAllowed(tab.url, await ensureConfig()) && (!owned || owned.includes(tab.id))) return tab;
   }
 
   if (tabResolvingPromise) return tabResolvingPromise;
@@ -312,11 +317,15 @@ async function resolveTab(tabId = null) {
  */
 async function _resolveTabInternal() {
   if (attachedTabId !== null) {
+    const owned = await preparationPages?.scopedTabIds?.();
     const tab = await chrome.tabs.get(attachedTabId).catch(() => null);
-    if (tab && urlAllowed(tab.url, await ensureConfig())) return tab;
+    if (tab && urlAllowed(tab.url, await ensureConfig()) && (!owned || owned.includes(tab.id))) return tab;
   }
   const scoped = await listScopedTabs();
   if (scoped.length > 0) return scoped[0];
+
+  const consoleScope = await preparationPages?.scopedTabIds?.();
+  if (consoleScope && !consoleScope.length) throw new Error('Console launch page is not authenticated by the local service');
 
   const cfg = await ensureConfig();
   if (!cfg.autoOpenOnCommand) throw new Error('No tab inside the configured scope is open');
@@ -329,6 +338,7 @@ async function _resolveTabInternal() {
   // is never armed for a tab the user made. Arming it here, and not after the
   // wait, also means a tab that never finishes loading is still reclaimed.
   const created = await chrome.tabs.create({ url: target, active: false });
+  await preparationPages?.trackCreatedTab(created).catch(() => {});
   autoCreatedTabId = created.id;
   scheduleAutoTabClose();
 
@@ -443,8 +453,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * rendered project list. The function must be self-contained — it is serialised
  * and re-created in the page, so it cannot close over anything here.
  */
-async function inPage(fn, args = []) {
-  const tab = await resolveTab();
+async function inPage(fn, args = [], existingOnly = false) {
+  const tab = existingOnly ? await currentScopedTab() : await resolveTab();
+  if (!tab) throw new Error('No existing Flow page; passive sync does not open a tab');
+  if (existingOnly && !urlAllowed(tab.url, await ensureConfig())) {
+    throw new Error('The existing page is outside the Flow scope');
+  }
   const results = await chrome.scripting.executeScript({
     target: { tabId: tab.id },
     world: 'MAIN',
@@ -493,23 +507,31 @@ function readProjectLinks() {
  */
 function readPageTokens() {
   const w = window.WIZ_global_data || {};
-  return { at: w.SNlM0e || '', fsid: w.FdrFJe || '' };
+  return { at: w.SNlM0e || '', fsid: w.FdrFJe || '', buildLabel: w.cfb2h || '' };
 }
 
 /**
- * Mint a reCAPTCHA Enterprise token with the page's own client.
- *
- * The `ready()` wait is load-bearing: skipping it still returns a token, but one
- * produced before the client finished initialising, and the assessment behind it
- * scores low enough that the upstream rejects the call. A token of the right
- * length is therefore not evidence that this worked.
+ * Inspect the public client before any token request. The current official app
+ * may replace public execute with an extension_hijack_detected wrapper. Respect
+ * that protection: never invoke it or try to recover the app's private function.
+ * No action means read-only inspection; client presence does not prove acceptance.
  */
 async function mintCaptcha(siteKey, action) {
   try {
-    if (!window.grecaptcha || !window.grecaptcha.enterprise) {
+    if (!window.grecaptcha || !window.grecaptcha.enterprise ||
+        typeof window.grecaptcha.enterprise.execute !== 'function') {
       return { available: false, error: 'the page has no reCAPTCHA client loaded' };
     }
+    const inspect = () => Function.prototype.toString.call(window.grecaptcha.enterprise.execute)
+      .includes('extension_hijack_detected');
+    const protectedResult = { available: false, verificationClientLoaded: true,
+      externalExecutionProtected: true, error: 'BROWSER_VERIFICATION_PROTECTED' };
+    if (inspect()) return protectedResult;
+    if (!action) return { available: true, verificationClientLoaded: true,
+      externalExecutionProtected: false };
     await new Promise((resolve) => window.grecaptcha.enterprise.ready(resolve));
+    // Initialization may install the protection while ready() is pending.
+    if (inspect()) return protectedResult;
     const token = await window.grecaptcha.enterprise.execute(siteKey, { action });
     return { available: true, token };
   } catch (e) {
@@ -563,9 +585,14 @@ async function dispatch(op, params = {}) {
           'tabs.list', 'tabs.open', 'tab.attach', 'tab.detach', 'tab.current',
           'events.read', 'cookies.list', 'cookies.names',
           'flow.fingerprint', 'flow.navigate', 'flow.projects',
-          'flow.captcha', 'flow.at', 'status',
+          'flow.captcha', 'flow.at', 'flow.consoleScope', 'status',
         ],
       };
+
+    case 'flow.consoleScope': {
+      const ids = await preparationPages?.scopedTabIds?.();
+      return { owned: !!ids?.length };
+    }
 
     case 'config.get':
       return cfg;
@@ -606,6 +633,7 @@ async function dispatch(op, params = {}) {
       const url = String(params.url || '');
       if (!urlAllowed(url, cfg)) throw new Error(`Refusing to open a URL outside the tab scope: ${url}`);
       const created = await chrome.tabs.create({ url, active: params.active !== false });
+      await preparationPages?.trackCreatedTab(created).catch(() => {});
       // Ours as well, and this is the one case where a tab we created is
       // deliberately in front of the user — `active` defaults to true here,
       // unlike in `resolveTab`. It is still reclaimed on the same idle
@@ -727,7 +755,7 @@ async function dispatch(op, params = {}) {
     }
 
     case 'flow.fingerprint': {
-      const fp = await inPage(readFingerprint);
+      const fp = await inPage(readFingerprint, [], true);
       if (!fp || !fp.userAgent) throw new Error('The page did not report an identity');
       return fp;
     }
@@ -744,19 +772,14 @@ async function dispatch(op, params = {}) {
       return await inPage(readProjectLinks);
 
     case 'flow.at': {
-      const t = await inPage(readPageTokens);
-      return { at: String((t && t.at) || ''), fsid: String((t && t.fsid) || '') };
+      const t = await inPage(readPageTokens, [], true);
+      return { at: String((t && t.at) || ''), fsid: String((t && t.fsid) || ''),
+        buildLabel: String((t && t.buildLabel) || '') };
     }
 
     case 'flow.captcha': {
       const action = String(params.action || '');
       const siteKey = cfg.recaptchaSiteKey || params.siteKey || '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV';
-      if (!action) {
-        // A probe: the caller wants to know whether the page can mint at all,
-        // usually to decide whether to navigate somewhere that can.
-        const fp = await inPage(() => !!(window.grecaptcha && window.grecaptcha.enterprise && window.grecaptcha.enterprise.execute));
-        return { available: !!fp };
-      }
       const out = await inPage(mintCaptcha, [siteKey, action]);
       if (out && out.token) state.captchaMints++;
       return out || { available: false, error: 'the page returned nothing' };
@@ -1003,4 +1026,5 @@ function onCookieChanged(change) {
 // `cookies.list` regardless — and it never writes a cookie.
 chrome.cookies.onChanged.addListener(onCookieChanged);
 
+preparationPages = startPreparationPages(() => inFlightOps === 0);
 connect();

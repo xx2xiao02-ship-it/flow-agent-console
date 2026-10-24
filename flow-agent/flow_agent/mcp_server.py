@@ -15,6 +15,7 @@ import uuid
 from typing import Any, Optional
 
 from .engine import EngineError, FlowEngine
+from .image_models import ImageModelError
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO = {"name": "flow-agent", "version": "1.0.0"}
@@ -171,7 +172,7 @@ async def call_tool(name: str, arguments: dict) -> dict:
             return {**_text(f"unknown tool {name!r}"), "isError": True}
     except KeyError as exc:
         return {**_text(f"missing required argument {exc}"), "isError": True}
-    except EngineError as exc:
+    except (EngineError, ImageModelError) as exc:
         # The engine's own words, and marked as an error so the model does not
         # read a failure as a result.
         return {**_text(str(exc)), "isError": True}

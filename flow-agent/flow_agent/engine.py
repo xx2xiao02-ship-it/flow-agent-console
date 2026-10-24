@@ -12,10 +12,17 @@ already exist in the binary — this is a caller, not a second engine.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
+import re
 import sqlite3
+import subprocess
+import httpx
 from pathlib import Path
 from typing import Any, Optional
+from .account_details import AccountReadError, FlowAccountReader
+from .image_models import ImageModelError, check_image_model
 
 #: How long a generation may take before it is killed. A video render polls for
 #: minutes, so this is generous by design rather than a hang guard.
@@ -140,6 +147,8 @@ class FlowEngine:
     ) -> None:
         if root:
             self.root = Path(root).resolve()
+        elif os.environ.get("FLOW_AGENT_ROOT"):
+            self.root = Path(os.environ["FLOW_AGENT_ROOT"]).resolve()
         else:
             pkg_dir = Path(__file__).resolve().parent
             if (pkg_dir / "bin").exists():
@@ -153,6 +162,13 @@ class FlowEngine:
         self.db_path = Path(db_path) if db_path else self.root / "data" / "flow.db"
         self.output_dir = Path(output_dir) if output_dir else self.root / "output"
         self.timeout = timeout
+        # Internal evidence for the console; never includes session contents.
+        self.last_balance_refresh: dict | None = None
+        # Set by the local console host. Standalone native CLI remains available.
+        self.browser_execution = None
+        self.official_images = None
+        self.official_videos = None
+        self.media_storage = None
 
     # -- process plumbing -------------------------------------------------
 
@@ -165,8 +181,42 @@ class FlowEngine:
         """
         return [str(self.binary)] + [str(a) for a in args if a not in (None, "")]
 
+    @staticmethod
+    def _process_env() -> dict[str, str]:
+        """Pass the Windows system HTTPS proxy to the Go binary when needed.
+
+        Chrome and Python use the Windows proxy settings automatically.  The
+        Flow binary only reads FLOW_PROXY, so without this bridge a machine
+        that needs a local proxy can log in but cannot refresh its balance.
+        An explicit FLOW_PROXY always wins.
+        """
+        import os
+        import platform
+        from urllib.parse import urlsplit
+        from urllib.request import getproxies
+
+        env = os.environ.copy()
+        if platform.system() != "Windows" or env.get("FLOW_PROXY"):
+            return env
+        proxy = getproxies().get("https") or getproxies().get("http")
+        if proxy:
+            if "://" not in proxy:
+                proxy = "http://" + proxy
+            parsed = urlsplit(proxy)
+            if parsed.scheme in ("http", "https", "socks5") and parsed.hostname:
+                env["FLOW_PROXY"] = proxy
+        return env
+
     async def _run(self, *args: Any, timeout: Optional[int] = None) -> tuple[str, str]:
         """Run one command and return (stdout, stderr), raising on a non-zero exit."""
+        if self.browser_execution and args and args[0] in ('image', 'generate', 'edit', 'browser-check'):
+            async def spawn(*bound_args):
+                return await self._spawn_run(*bound_args, timeout=timeout, browser=True)
+            return await self.browser_execution.run(args, spawn)
+        return await self._spawn_run(*args, timeout=timeout)
+
+    async def _spawn_run(self, *args: Any, timeout: Optional[int] = None,
+                         browser: bool = False) -> tuple[str, str]:
         if not self.binary.exists():
             raise EngineError(
                 self._command(*args), 127, "", f"no engine binary at {self.binary}"
@@ -182,14 +232,31 @@ class FlowEngine:
         command = self._command(*args)
         limit = timeout or self.timeout
 
+        env = self._process_env()
+        if self.media_storage is not None:
+            # The native engine already supports this setting. Keep cwd,
+            # cookies and databases at their original locations.
+            env['FLOW_OUTPUT_DIR'] = str(self.output_dir)
+        if browser:
+            env.update(FLOW_AUTO_RETRY='0', FLOW_NO_SUBMISSION_REPLAY='1')
+            if args[0] == 'browser-check':
+                env['FLOW_BLOCK_GENERATION'] = '1'
         proc = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(self.root),
+            env=env,
+            # The desktop EXE has no console; its console-subsystem Go child
+            # would otherwise create a command window on every query/task.
+            **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}),
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), limit)
+        except asyncio.CancelledError:
+            proc.kill()
+            await proc.wait()
+            raise
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
@@ -235,6 +302,26 @@ class FlowEngine:
         which happens with `download=False` and on a refusal alike, so a caller
         that needs the bytes should read it and not assume it.
         """
+        if getattr(self, 'startup_readiness', None) is not None:
+            self.startup_readiness.require_ready()
+        if self.official_images is not None and model.lower() == 'beluga':
+            return await self.official_images.run(
+                prompt=prompt, aspect=aspect, count=count, model=model.lower(),
+                all_accounts=all_accounts, cookies=cookies, download=download, timeout=timeout)
+        # Check the exact account before spending a captcha/generation. Never
+        # substitute BELUGA for an explicitly requested legacy NARWHAL model.
+        if cookies and Path(cookies).is_file():
+            try:
+                bundle = json.loads(Path(cookies).read_text(encoding="utf-8"))
+                from . import proxy_pool
+                bound_service = getattr(self.official_images, 'service', None)
+                proxy = (proxy_pool.raw_url_for(bound_service, Path(cookies).stem)
+                         if bound_service else None) or self._process_env().get("FLOW_PROXY")
+                async with httpx.AsyncClient(proxy=proxy,
+                                             timeout=15, follow_redirects=False) as client:
+                    await check_image_model(FlowAccountReader(client, bundle), model)
+            except (AccountReadError, ValueError, OSError, TypeError, AttributeError):
+                raise ImageModelError("catalog_unread") from None
         args: list[Any] = ["image", prompt, aspect]
         if count and count > 1:
             args.append(f"x{count}")
@@ -261,6 +348,9 @@ class FlowEngine:
         cookies: Optional[str] = None,
         download: bool = True,
         timeout: Optional[int] = None,
+        end_image: Optional[str] = None,
+        references: Optional[list[str]] = None,
+        video_model: str = 'omni_flash',
     ) -> dict:
         """Generate a video and return the engine's result object.
 
@@ -268,11 +358,29 @@ class FlowEngine:
         `quality` and `status`. A render is asynchronous, so with `download=False`
         the ids are returned before the file exists.
         """
-        args: list[Any] = ["generate", prompt, aspect, duration, quality]
+        if getattr(self, 'startup_readiness', None) is not None:
+            self.startup_readiness.require_ready()
+        if references and (start_image or end_image or all_accounts or count != 1 or quality != "720p"):
+            raise ValueError("参考图不能与首尾帧、并发、批量或 360p 混用")
+        if self.official_videos is not None:
+            model_options = {'video_model': video_model} if video_model != 'omni_flash' else {}
+            return await self.official_videos.run(cookies=cookies, prompt=prompt,
+                aspect=aspect, duration=duration, quality=quality, count=count,
+                start_image=start_image, end_image=end_image, references=references,
+                all_accounts=all_accounts, download=download, timeout=timeout, **model_options)
+        if video_model != 'omni_flash':
+            raise ValueError('Veo 生成需要官方网页执行器；原 CLI 不支持指定 Veo，不会降级生成 Omni')
+        # Reference RPC has no aspect/quality/count slots. Do not pass flags
+        # the CLI would silently ignore on this path.
+        args: list[Any] = ["generate", "--prompt", prompt, "--duration", duration.removesuffix("s")] if references else ["generate", prompt, aspect, duration, quality]
         if count and count > 1:
             args.append(f"x{count}")
         if start_image:
             args += ["--start-image", start_image]
+        if end_image:
+            args += ["--end-image", end_image]
+        for reference in references or []:
+            args += ["--reference", reference]
         if all_accounts:
             args.append("--all")
         if cookies:
@@ -280,6 +388,16 @@ class FlowEngine:
         if not download:
             args.append("--no-download")
 
+        return await self._run_json(*args, timeout=timeout)
+
+    async def edit_video(self, prompt: str, source: str, cookies: Optional[str] = None,
+                         timeout: Optional[int] = None) -> dict:
+        """Edit a local video; CLI uploads it in the same account/project first."""
+        if getattr(self, 'startup_readiness', None) is not None:
+            self.startup_readiness.require_ready()
+        args: list[Any] = ["edit", "--source", source, "--prompt", prompt]
+        if cookies:
+            args += ["--cookies", cookies]
         return await self._run_json(*args, timeout=timeout)
 
     async def upload_video(
@@ -308,12 +426,103 @@ class FlowEngine:
     async def get_balance(self, refresh: bool = False) -> dict:
         """Report every account's credits.
 
-        `refresh` probes upstream first. Either way the figures are read from the
-        database, because `balance --refresh` prints a table rather than JSON —
-        the probe's job is to write the database, and that is the interface.
+        `refresh` registers the engine accounts and verifies live balances
+        against each account's own cookie bundle. Cached reads retain the
+        existing database contract.
         """
         if refresh:
-            await self._run("balance", "--refresh")
+            # Balance is a short upstream probe, unlike a video render.  Do not
+            # leave a console refresh waiting for the generation timeout.
+            before = await asyncio.to_thread(self._balance_check_times)
+            snapshots = {}
+            bundles = {}
+            for path in (self.root / "cookies").glob("account_*.json"):
+                raw = path.read_bytes()
+                snapshots[path.stem] = hashlib.sha256(raw).hexdigest()
+                try:
+                    bundles[path.stem] = json.loads(raw)
+                except ValueError:
+                    continue
+            self.last_balance_refresh = None
+            out, err = await self._run("balance", "--refresh", timeout=45)
+            after = await asyncio.to_thread(self._balance_check_times)
+            # The binary's table uses file hashes, while SQLite uses core
+            # identity hashes. Its registration diagnostics are the explicit
+            # relation between them. Only trust this invocation, never old logs.
+            pairs = re.findall(
+                r"registered account (acct-[\w-]+) from (account_[\w-]+)\.json", err)
+            # The table on stdout is the only authoritative indication that a
+            # balance was actually read. The SQLite timestamp can change even
+            # when the upstream request returns "not read", leaving an older
+            # numeric value in the row.
+            reported: dict[str, int] = {}
+            for match in re.finditer(
+                    r"^\s*\d+\s+\(([^)]+)\)\s+\S+\s+\S+\s+(not read|\d+)\s+\S+\s*$",
+                    out, re.MULTILINE | re.IGNORECASE):
+                if match.group(2).lower() != "not read":
+                    reported[match.group(1).lower()] = int(match.group(2))
+            failed = set(re.findall(r"credit check failed for (acct-[\w-]+)", err))
+            bindings = {}
+            for account_id, key in pairs:
+                if key in snapshots:
+                    bindings.setdefault(key, set()).add(account_id)
+            unique = {key: next(iter(ids)) for key, ids in bindings.items() if len(ids) == 1}
+            counts = {value: list(unique.values()).count(value) for value in unique.values()}
+            unique = {key: value for key, value in unique.items() if counts[value] == 1}
+            refreshed = {account_id for key, account_id in unique.items()
+                         if account_id not in failed and key.removeprefix("account_").lower() in reported}
+            credits_by_account = {account_id: reported[key.removeprefix("account_").lower()]
+                                  for key, account_id in unique.items()
+                                  if account_id in refreshed}
+            # Some shipped engines print `(file-hash)` as Account ID even
+            # though their DB uses `acct-core-hash`, hence a live successful
+            # probe appears as 'not read'. Verify the same file's nzlxg response
+            # directly; timestamps alone cannot distinguish a stale DB value.
+            details = {}
+            from . import proxy_pool
+            bound_service = getattr(self.official_images, 'service', None)
+            default_proxy = self._process_env().get("FLOW_PROXY")
+            started = asyncio.get_running_loop().time()
+            for key, bundle in bundles.items():
+                remaining = 45 - (asyncio.get_running_loop().time() - started)
+                if remaining <= 0:
+                    break
+                # One client per account so its bound exit stays sticky.
+                proxy = (proxy_pool.raw_url_for(bound_service, key)
+                         if bound_service else None) or default_proxy
+                try:
+                    async with httpx.AsyncClient(proxy=proxy, timeout=8,
+                                                 follow_redirects=False) as client:
+                        result = await asyncio.wait_for(FlowAccountReader(client, bundle).read(), remaining)
+                except (AccountReadError, ValueError, TypeError, KeyError, AttributeError, asyncio.TimeoutError):
+                    continue  # Per-account timeout keeps confirmed partial readings.
+                path = self.root / "cookies" / (key + ".json")
+                if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != snapshots[key]:
+                    continue
+                details[key] = result
+                account_id = unique.get(key)
+                if account_id and result["credits"] is not None:
+                    credits_by_account[account_id] = result["credits"]
+                    refreshed.add(account_id)
+            reason = ("network" if any(x in err.lower() for x in
+                      ("dial tcp", "deadline exceeded", "operation was canceled", "tls handshake"))
+                      else "session" if any(x in err.lower() for x in ("401", "unauthorized"))
+                      else "unread")
+            self.last_balance_refresh = {
+                "bindings": unique, "digests": snapshots,
+                "refreshed": sorted(refreshed), "credits_by_account": credits_by_account,
+                "reason": reason, "details": details,
+            }
+            report = await asyncio.to_thread(self._read_balance)
+            # A refresh is a snapshot of this invocation. Any row not confirmed
+            # by its output is historical/unknown and must not leak its old
+            # numeric value through the REST API.
+            for account in report["accounts"]:
+                account["credits"] = credits_by_account.get(account["account_id"])
+            read = [a["credits"] for a in report["accounts"] if a["credits"] is not None]
+            report["total_credits"] = sum(read) if read else 0
+            report["unread"] = len(report["accounts"]) - len(read)
+            return report
         return await asyncio.to_thread(self._read_balance)
 
     async def get_stats(self) -> dict:
@@ -377,6 +586,15 @@ class FlowEngine:
             "total_credits": sum(a["credits"] for a in read),
             "unread": len(accounts) - len(read),
         }
+
+    def _balance_check_times(self) -> dict[str, str | None]:
+        if not self.db_path.exists():
+            return {}
+        with self._connect() as conn:
+            columns = {row[1] for row in conn.execute("pragma table_info(accounts)")}
+            if "credits_checked_at" not in columns:
+                return {}
+            return dict(conn.execute("select account_id, credits_checked_at from accounts"))
 
     def _read_stats(self) -> dict:
         if not self.db_path.exists():

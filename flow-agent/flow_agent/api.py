@@ -16,7 +16,8 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from .engine import EngineError, FlowEngine
@@ -29,11 +30,26 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://127.0.0.1:5173", "http://localhost:5173",
+                   "http://127.0.0.1:8001", "http://localhost:8001"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def reject_foreign_browser_origin(request: Request, call_next):
+    origin = request.headers.get("origin")
+    allowed_origins = {
+        "http://127.0.0.1:5173", "http://localhost:5173",
+        "http://127.0.0.1:8001", "http://localhost:8001",
+    }
+    if request.url.hostname in {"127.0.0.1", "localhost", "testserver"}:
+        allowed_origins.add(str(request.base_url).rstrip("/"))
+    if origin and origin not in allowed_origins:
+        return JSONResponse({"detail": "cross-origin browser request denied"}, status_code=403)
+    return await call_next(request)
 
 engine = FlowEngine()
 
@@ -135,6 +151,9 @@ def _media_url(request: Request, path: str) -> str:
     response is correct whether this is reached on localhost, a LAN address or
     behind a proxy.
     """
+    storage = getattr(engine, 'media_storage', None)
+    if storage is not None:
+        return str(request.base_url).rstrip('/') + storage.url(Path(path).resolve().parent, Path(path).name)
     return f"{str(request.base_url).rstrip('/')}/api/v1/media/{Path(path).name}"
 
 
@@ -401,12 +420,14 @@ async def flow_projects(cookies: Optional[str] = None):
 
 @app.get("/v1/media/{filename:path}")
 @app.get("/api/v1/media/{filename:path}")
-async def flow_media(filename: str):
+async def flow_media(filename: str, storage: str | None = None):
     """Serve one generated file.
 
     The name is resolved against the output directory and rejected if it escapes
     it: this route takes a path from a URL, and `..` in one is the whole attack.
     """
+    if getattr(engine, 'media_storage', None) is not None:
+        return FileResponse(engine.media_storage.resolve(filename, storage))
     candidate = (MEDIA_DIR / filename).resolve()
     if candidate.parent != MEDIA_DIR.resolve() or not candidate.is_file():
         raise HTTPException(status_code=404, detail="no such media file")
@@ -415,4 +436,42 @@ async def flow_media(filename: str):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "engine": engine.available(), "binary": str(engine.binary)}
+    return {"status": "ok" if console_service.startup.snapshot()["ready"] else "starting" if console_service.startup.state == "checking" else "blocked", "engine": engine.available(), "binary": str(engine.binary), "startup": console_service.startup.snapshot()}
+
+
+# The console is an additive local surface. Existing CLI, REST and MCP routes
+# continue to use the same engine and keep their public request shapes.
+from .console import ConsoleService, create_console_router, safe_failure
+from .image_models import ImageModelError
+from .official_images import OfficialImageError
+
+
+@app.exception_handler(ImageModelError)
+async def image_model_preflight_error(request: Request, exc: ImageModelError):
+    return JSONResponse({"detail": safe_failure(exc)}, status_code=422)
+
+@app.exception_handler(OfficialImageError)
+async def official_image_page_error(request: Request, exc: OfficialImageError):
+    return JSONResponse({"detail": safe_failure(exc)}, status_code=409)
+
+console_service = ConsoleService(engine)
+app.include_router(create_console_router(console_service))
+
+
+@app.on_event("startup")
+async def start_console():
+    await console_service.start()
+
+
+@app.on_event("shutdown")
+async def stop_console():
+    await console_service.stop()
+
+
+_console_dist = engine.root.parent / "web" / "dist"
+if _console_dist.is_dir():
+    @app.get("/", include_in_schema=False)
+    async def console_home():
+        return RedirectResponse(url="/console/", status_code=307)
+
+    app.mount("/console", StaticFiles(directory=_console_dist, html=True), name="console")

@@ -19,7 +19,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const extDir = path.resolve(here, '..');
@@ -32,7 +32,7 @@ const extDir = path.resolve(here, '..');
 // CommonJS and choke on its `import`. Copying the two real files into a staged
 // directory with a one-line package.json keeps the originals untouched.
 const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'fgext-'));
-for (const file of ['background.js', 'config.js', 'popup.js']) {
+for (const file of ['background.js', 'config.js', 'popup.js', 'preparation-pages.js']) {
   fs.copyFileSync(path.join(extDir, file), path.join(stage, file));
 }
 fs.writeFileSync(path.join(stage, 'package.json'), JSON.stringify({ type: 'module' }));
@@ -65,7 +65,7 @@ fs.writeFileSync(path.join(stage, 'package.json'), JSON.stringify({ type: 'modul
  * ------------------------------------------------------------------ */
 
 const manifest = JSON.parse(fs.readFileSync(path.join(extDir, 'manifest.json'), 'utf8'));
-const { DEFAULTS } = await import(path.join(stage, 'config.js'));
+const { DEFAULTS } = await import(pathToFileURL(path.join(stage, 'config.js')).href);
 
 /** Does one manifest host pattern cover a bare host? */
 function patternCoversHost(pattern, host) {
@@ -211,7 +211,13 @@ const chromeStub = {
     onStartup: { addListener: () => {} },
     onInstalled: { addListener: () => {} },
     onMessage: {
-      addListener: (fn) => { workerOnMessage = fn; },
+      addListener: (fn) => {
+        const previous = workerOnMessage;
+        workerOnMessage = (msg, sender, reply) => {
+          const earlier = previous?.(msg, sender, reply);
+          return fn(msg, sender, reply) || earlier;
+        };
+      },
     },
     // Routes a popup message into the worker's own dispatcher.
     sendMessage: (msg) =>
@@ -226,13 +232,17 @@ const chromeStub = {
   alarms: {
     create: (name, info) => { armedAlarms.set(name, info); alarmCreations.push(name); },
     clear: async (name) => { armedAlarms.delete(name); return true; },
-    onAlarm: { addListener: (fn) => { alarmsOnAlarm = fn; } },
+    onAlarm: { addListener: (fn) => {
+      const previous = alarmsOnAlarm;
+      alarmsOnAlarm = async alarm => { if (previous) await previous(alarm); await fn(alarm); };
+    } },
   },
   action: {
     setBadgeText: async ({ text }) => { badgeText = text; },
     setBadgeBackgroundColor: async () => {},
   },
   storage: {
+    session: { get: async () => ({}), set: async () => {} },
     local: {
       get: async (key) => (store.has(key) ? { [key]: store.get(key) } : {}),
       set: async (obj) => { for (const [k, v] of Object.entries(obj)) store.set(k, v); },
@@ -240,6 +250,8 @@ const chromeStub = {
     },
   },
   tabs: {
+    onCreated: { addListener: () => {} },
+    onUpdated: { addListener: () => {} },
     query: async () => tabs,
     get: async (id) => {
       const tab = tabs.find((t) => t.id === id);
@@ -277,7 +289,10 @@ const chromeStub = {
       removedTabs.push(id);
       tabs.splice(at, 1);
     },
-    onRemoved: { addListener: (fn) => { tabsOnRemoved = fn; } },
+    onRemoved: { addListener: (fn) => {
+      const previous = tabsOnRemoved;
+      tabsOnRemoved = id => { if (previous) previous(id); fn(id); };
+    } },
   },
   cookies: {
     onChanged: {
@@ -327,7 +342,7 @@ const page = {
   },
   // Both values the app puts on a batchexecute request: the anti-CSRF token in
   // the body and the session id in the query string.
-  WIZ_global_data: { SNlM0e: 'at-value', FdrFJe: '-56329636' },
+  WIZ_global_data: { SNlM0e: 'at-value', FdrFJe: '-56329636', cfb2h: 'boq_labs-ai-sandbox-frontend_20261016.00_p1' },
 };
 
 // An `upscaleFrame` fixture used to live here, with a guard that proved it
@@ -409,7 +424,7 @@ for (const [key, descriptor] of Object.entries(descriptors)) {
   Object.defineProperty(globalThis, key, descriptor);
 }
 
-await import(path.join(stage, 'background.js'));
+await import(pathToFileURL(path.join(stage, 'background.js')).href);
 
 // connect() is async — let it reach `new WebSocket(...)`.
 for (let i = 0; i < 10 && sockets.length === 0; i++) {
@@ -533,6 +548,16 @@ await check('flow.at returns the page tokens the app sends', async () => {
   // together from one live capture.
   assert.equal(out.at, 'at-value');
   assert.equal(out.fsid, '-56329636');
+  assert.equal(out.buildLabel, 'boq_labs-ai-sandbox-frontend_20261016.00_p1');
+});
+
+await check('passive metadata sync never recreates a closed Flow page', async () => {
+  const original = tabs.splice(0);
+  try {
+    assert.match(await callExpectingError('flow.at', {}), /No existing Flow page/);
+    assert.match(await callExpectingError('flow.fingerprint', {}), /No existing Flow page/);
+    assert.equal(tabs.length, 0, 'passive sync must not open a tab');
+  } finally { tabs.push(...original); }
 });
 
 await check('flow.captcha probe matches FlowCaptchaResult', async () => {
@@ -547,6 +572,63 @@ await check('flow.captcha mint matches FlowCaptchaResult', async () => {
   assert.equal(mint.available, true);
   assert.equal(typeof mint.token, 'string');
   assert.ok(mint.token.length > 0);
+});
+
+await check('official public execute protection blocks probe and mint without execution', async () => {
+  const original = page.grecaptcha.enterprise;
+  let executions = 0;
+  let readyCalls = 0;
+  try {
+    // Local fixture reproduces the action rewriting in the official public JS.
+    page.grecaptcha.enterprise = {
+      ready: (resolve) => { readyCalls++; resolve(); },
+      execute: async (key, options) => {
+        executions++;
+        return { action: 'extension_hijack_detected', key, options };
+      },
+    };
+    for (const params of [{}, { action: 'IMAGE_GENERATION' }]) {
+      const result = await call('flow.captcha', params);
+      assert.equal(result.available, false);
+      assert.equal(result.error, 'BROWSER_VERIFICATION_PROTECTED');
+      assert.equal(result.verificationClientLoaded, true);
+      assert.equal(result.externalExecutionProtected, true);
+      assert.equal(result.token, undefined);
+    }
+    assert.equal(executions, 0);
+    assert.equal(readyCalls, 0, 'read-only protection check must not initialize captcha');
+  } finally { page.grecaptcha.enterprise = original; }
+});
+
+await check('protection installed during ready also prevents token acquisition', async () => {
+  const original = page.grecaptcha.enterprise;
+  let executions = 0;
+  try {
+    page.grecaptcha.enterprise = {
+      execute: async () => { executions++; return 'must-not-mint'; },
+      ready: (resolve) => {
+        page.grecaptcha.enterprise.execute = async () => {
+          executions++;
+          return 'extension_hijack_detected';
+        };
+        resolve();
+      },
+    };
+    const result = await call('flow.captcha', { action: 'IMAGE_GENERATION' });
+    assert.equal(result.error, 'BROWSER_VERIFICATION_PROTECTED');
+    assert.equal(result.token, undefined);
+    assert.equal(executions, 0);
+  } finally { page.grecaptcha.enterprise = original; }
+});
+
+await check('missing execute is unavailable and never attempts initialization', async () => {
+  const original = page.grecaptcha.enterprise;
+  try {
+    page.grecaptcha.enterprise = { ready: () => { throw new Error('must not run'); } };
+    const result = await call('flow.captcha', {});
+    assert.equal(result.available, false);
+    assert.equal(result.token, undefined);
+  } finally { page.grecaptcha.enterprise = original; }
 });
 
 // Four `flow.upscale` cases used to sit here, covering the frame parse, an
@@ -879,7 +961,7 @@ globalThis.navigator.clipboard = {
   writeText: async (text) => { clipboardText = text; },
 };
 
-await import(path.join(stage, 'popup.js'));
+await import(pathToFileURL(path.join(stage, 'popup.js')).href);
 await new Promise((resolve) => setTimeout(resolve, 20));
 
 /**

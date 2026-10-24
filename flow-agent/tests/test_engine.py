@@ -1,10 +1,42 @@
 """Tests for the engine bridge: result extraction and the read-only queries."""
 
 import sqlite3
+import os
+import sys
+import subprocess
 
 import pytest
 
-from flow_agent.engine import FlowEngine, extract_json
+from flow_agent.engine import EngineError, FlowEngine, extract_json
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_code", [0, 7])
+async def test_engine_child_is_hidden_and_keeps_output_and_exit_code(tmp_path, monkeypatch, exit_code):
+    import asyncio
+    real_spawn = asyncio.create_subprocess_exec
+    observed = {}
+
+    async def spawn(*args, **kwargs):
+        observed.update(kwargs)
+        return await real_spawn(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    engine = FlowEngine(root=tmp_path, binary=sys.executable)
+    code = f"import sys; print('result-out'); print('result-err', file=sys.stderr); sys.exit({exit_code})"
+    if exit_code:
+        with pytest.raises(EngineError) as caught:
+            await engine._run("-c", code)
+        assert caught.value.returncode == exit_code
+        out, err = caught.value.stdout, caught.value.stderr
+    else:
+        out, err = await engine._run("-c", code)
+    assert out.strip() == "result-out"
+    assert err.strip() == "result-err"
+    if os.name == "nt":
+        assert observed["creationflags"] & subprocess.CREATE_NO_WINDOW
+    else:
+        assert "creationflags" not in observed
 
 # --------------------------------------------------------------------------- #
 # extract_json
@@ -82,7 +114,7 @@ def test_extract_json_raises_on_a_truncated_object():
 def test_command_drops_arguments_that_were_not_given():
     engine = FlowEngine(root="/tmp", binary="/bin/echo")
     assert engine._command("image", "a boat", None, "", "x2") == [
-        "/bin/echo",
+        str(engine.binary),
         "image",
         "a boat",
         "x2",
@@ -92,7 +124,16 @@ def test_command_drops_arguments_that_were_not_given():
 def test_command_keeps_falsy_values_that_are_not_absent():
     """`0` is a value. Only None and "" mean "not given"."""
     engine = FlowEngine(root="/tmp", binary="/bin/echo")
-    assert engine._command("image", "p", 0) == ["/bin/echo", "image", "p", "0"]
+    assert engine._command("image", "p", 0) == [str(engine.binary), "image", "p", "0"]
+
+
+def test_windows_system_proxy_reaches_flow_binary_without_overriding_explicit_choice(monkeypatch):
+    monkeypatch.setattr("platform.system", lambda: "Windows")
+    monkeypatch.setattr("urllib.request.getproxies", lambda: {"https": "127.0.0.1:7897"})
+    monkeypatch.delenv("FLOW_PROXY", raising=False)
+    assert FlowEngine._process_env()["FLOW_PROXY"] == "http://127.0.0.1:7897"
+    monkeypatch.setenv("FLOW_PROXY", "http://127.0.0.1:9000")
+    assert FlowEngine._process_env()["FLOW_PROXY"] == "http://127.0.0.1:9000"
 
 
 # --------------------------------------------------------------------------- #
@@ -177,6 +218,53 @@ def test_read_balance_fills_a_missing_status(engine_with_db):
         [("a", 5, None)],
     )
     assert engine_with_db._read_balance()["accounts"][0]["status"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_balance_refresh_requires_new_database_check_and_unambiguous_registration(engine_with_db, monkeypatch):
+    engine = engine_with_db
+    cookie_dir = engine.root / "cookies"
+    cookie_dir.mkdir()
+    for key in ("a", "b", "duplicate"):
+        (cookie_dir / f"account_{key}.json").write_text('{}')
+    with sqlite3.connect(engine.db_path) as db:
+        db.execute("alter table accounts add column credits_checked_at text")
+        db.executemany("insert into accounts values (?, ?, ?, ?)", [
+            ("acct-core-a", 50, "active", "old"), ("acct-core-b", 100, "active", "old")])
+
+    async def refresh(*args, **kwargs):
+        with sqlite3.connect(engine.db_path) as db:
+            db.execute("update accounts set credits_checked_at='new'")
+        return ("  1  (a)  a  project  50  active\n"
+                "  2  (b)  b  project  not read  unknown\n"), (
+            "registered account acct-core-a from account_a.json\n"
+            "registered account acct-core-b from account_b.json\n"
+            "credit check failed for acct-core-b: dial tcp PRIVATE\n")
+    monkeypatch.setattr(engine, "_run", refresh)
+    result = await engine.get_balance(refresh=True)
+    evidence = engine.last_balance_refresh
+    assert evidence["bindings"] == {"account_a": "acct-core-a", "account_b": "acct-core-b"}
+    assert evidence["refreshed"] == ["acct-core-a"]
+    assert evidence["reason"] == "network"
+    assert "PRIVATE" not in str(result) + str(evidence)
+    assert result["accounts"][0]["credits"] == 50
+    assert result["accounts"][1]["credits"] is None
+    # A repeated numeric answer is still valid; the table is authoritative,
+    # while the database timestamp is not. A repeated "not read" is rejected.
+    async def unread_again(*args, **kwargs):
+        return "  1  (a)  a  project  not read  unknown\n", (
+            "registered account acct-core-a from account_a.json\n"
+            "registered account acct-core-b from account_b.json\n")
+    monkeypatch.setattr(engine, "_run", unread_again)
+    await engine.get_balance(refresh=True)
+    assert engine.last_balance_refresh["refreshed"] == []
+
+    async def ambiguous(*args, **kwargs):
+        return "", ("registered account acct-core-a from account_a.json\n"
+                    "registered account acct-core-a from account_duplicate.json\n")
+    monkeypatch.setattr(engine, "_run", ambiguous)
+    await engine.get_balance(refresh=True)
+    assert engine.last_balance_refresh["bindings"] == {}
 
 
 def test_read_stats_reports_a_credits_total_that_skips_null(engine_with_db):
@@ -278,3 +366,32 @@ def test_find_binary_selects_platform_executable(tmp_path, monkeypatch):
     mac_bin.write_text("dummy")
     monkeypatch.setattr("platform.system", lambda: "Darwin")
     assert FlowEngine._find_binary(tmp_path) == mac_bin
+
+
+@pytest.mark.asyncio
+async def test_video_reference_argv_does_not_send_ignored_flags(tmp_path, monkeypatch):
+    engine = FlowEngine(root=tmp_path)
+    calls = []
+    async def capture(*args, **kwargs):
+        calls.append(args)
+        return {'status': 'succeeded'}
+    monkeypatch.setattr(engine, '_run_json', capture)
+    await engine.generate_video('prompt', duration='6s', references=['second.png', 'first.png'], cookies='session.json')
+    assert calls == [('generate', '--prompt', 'prompt', '--duration', '6', '--reference', 'second.png', '--reference', 'first.png', '--cookies', 'session.json')]
+    with pytest.raises(ValueError):
+        await engine.generate_video('x', references=['a'], start_image='b')
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_video_edit_argv_uses_real_cli_command(tmp_path, monkeypatch):
+    engine = FlowEngine(root=tmp_path)
+    calls = []
+    async def capture(*args, **kwargs):
+        calls.append(args)
+        return {}
+    monkeypatch.setattr(engine, '_run_json', capture)
+    await engine.edit_video('make it blue', 'source.mp4', cookies='session.json')
+    assert calls == [('edit', '--source', 'source.mp4', '--prompt', 'make it blue', '--cookies', 'session.json')]
+    await engine.generate_video('x', start_image='a.png', end_image='b.png')
+    assert calls[-1][-4:] == ('--start-image', 'a.png', '--end-image', 'b.png')

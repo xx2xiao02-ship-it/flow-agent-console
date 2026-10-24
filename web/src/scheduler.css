@@ -1,0 +1,28 @@
+.scheduler-panel{padding:24px 26px;margin-bottom:24px}
+.scheduler-heading{display:flex;align-items:center;justify-content:space-between;gap:16px}
+.scheduler-heading h3{margin:0;font-size:17px;letter-spacing:.02em}
+.scheduler-heading p{margin:8px 0 0;color:#a4aec1;font-size:12px;line-height:1.6}
+.scheduler-default{padding:7px 11px;border:1px solid #5b4b83;border-radius:7px;background:#a286ed12;color:#d4c4ff;font-size:11px;white-space:nowrap}
+.scheduler-body{display:grid;grid-template-columns:minmax(330px,1.2fr) minmax(270px,1fr);gap:28px;align-items:center;padding:24px 0}
+.scheduler-editor{min-width:0}
+.scheduler-label{display:block;color:#e9eaf0;font-size:12px;margin-bottom:12px}
+.scheduler-label span{font-size:11px;color:#99a4b9;margin-left:12px}
+.scheduler-controls{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.scheduler-stepper{display:flex;align-items:center;flex-shrink:0;border:1px solid #44465f;border-radius:10px;background:#11151f;height:48px;overflow:hidden}
+.scheduler-stepper button{width:42px;height:46px;padding:0;background:transparent;border:0;color:#c9bddf;font-size:20px}
+.scheduler-stepper input{appearance:textfield;-moz-appearance:textfield;width:62px!important;height:46px;margin:0!important;padding:0!important;text-align:center;background:transparent!important;border:0!important;border-radius:0;color:#f1ecff;font-size:24px;font-weight:650;font-variant-numeric:tabular-nums}
+.scheduler-stepper input::-webkit-inner-spin-button,.scheduler-stepper input::-webkit-outer-spin-button{appearance:none;margin:0}
+.scheduler-controls .scheduler-save{padding:0 20px;height:46px;background:#9876ed;border:1px solid #a78bf0;color:#fff;border-radius:9px;font-size:12px;font-weight:600;white-space:nowrap}
+.scheduler-controls .scheduler-max{height:44px;padding:0 4px;background:transparent;border:0;color:#c5b3f2;font-size:12px;white-space:nowrap}
+.scheduler-panel button:disabled{opacity:.4;cursor:not-allowed}
+.scheduler-panel button:focus-visible,.scheduler-panel input:focus-visible,.scheduler-panel summary:focus-visible{outline:2px solid #bda2ff;outline-offset:-3px}
+.scheduler-stepper button:not(:disabled):hover{background:#a286ed18}.scheduler-save:not(:disabled):hover{background:#a78af0}.scheduler-max:not(:disabled):hover{color:#e0d4ff;text-decoration:underline}
+.scheduler-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));margin:0;border-left:1px solid #303647;padding-left:24px;gap:20px}
+.scheduler-stats dt{display:flex;align-items:center;gap:6px;font-size:11px;color:#a4aec1;white-space:nowrap}
+.scheduler-stats dd{margin:10px 0 0;font-size:28px;line-height:1.2;color:#eef0f6;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap}
+.scheduler-stats dd small{font-size:13px;font-weight:400;color:#8894ac}.scheduler-dot{width:6px;height:6px;display:inline-block;background:#69c9aa;border-radius:50%}
+.scheduler-footer{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;border-top:1px solid #303647;padding-top:14px;color:#99a4b9;font-size:11px;line-height:1.8}
+.scheduler-footer p{margin:0}.scheduler-footer details{max-width:360px}.scheduler-footer summary{cursor:pointer;white-space:nowrap;color:#c0b2df}.scheduler-footer details p{margin-top:8px}
+.scheduler-notice{margin:14px 0 0;padding:10px 12px;border-radius:8px;background:#27524144;color:#9be0c2;font-size:12px;line-height:1.7}.scheduler-panel .scheduler-error{color:#ffb5bd;font-size:12px}.scheduler-notice.scheduler-error{background:#63293a44}
+@media(max-width:1100px){.scheduler-body{grid-template-columns:1fr;gap:22px}.scheduler-stats{border-left:0;border-top:1px solid #303647;padding:18px 0 0}.scheduler-stats dd{font-size:25px}}
+@media(max-width:600px){.scheduler-panel{padding:20px 18px}.scheduler-heading{align-items:flex-start}.scheduler-heading p{max-width:200px}.scheduler-footer{flex-direction:column;gap:10px}.scheduler-stats{gap:12px}.scheduler-stats dt{font-size:10px}.scheduler-stats dd{font-size:23px}.scheduler-controls{gap:10px}.scheduler-controls .scheduler-save{padding:0 15px}}

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "flow-console": {
+      "command": "E:/FLOW/flow-agent/.venv/Scripts/python.exe",
+      "args": ["-u", "E:/FLOW/flow-agent/console_mcp_entry.py"],
+      "env": {"FLOW_MCP_URL": "http://127.0.0.1:8001", "FLOW_MCP_READ_ONLY": "0"}
+    }
+  }
+}

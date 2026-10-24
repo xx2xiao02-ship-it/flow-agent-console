@@ -48,6 +48,10 @@ Flow Agent is a **local server and CLI** that connects to Google Flow to generat
 
 ## Quick Start
 
+> Windows 中文 Web 管理后台：运行仓库根目录的 `Start-FlowConsole.ps1`，
+> 具体步骤与能力边界见 [Windows 控制台说明](docs/WINDOWS_CONSOLE.md)。
+> 其他项目接入见 [接口接入说明](docs/INTEGRATION_API.md)，后台左侧也有“接口接入”标签。
+
 ### 1 — Install
 
 ```bash
@@ -344,3 +348,8 @@ python3 -m pytest -q --basetemp=/tmp/fa_test
 ## License
 
 MIT — free to use, modify, and distribute.
+
+
+## 管理后台 MCP 与 Skill
+
+复用现有后台队列的 stdio MCP 与 `flow-generate` Skill 接入说明：[MCP_SKILL.md](docs/MCP_SKILL.md)。与原有 `main.py mcp` 入口独立，保留原接口兼容。

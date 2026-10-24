@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Flow Bridge",
-  "version": "1.0.0",
+  "version": "1.0.10",
   "description": "Real-time session and cookie synchronizer for Google Flow.",
   "minimum_chrome_version": "116",
   "permissions": [
@@ -20,9 +20,14 @@
     "https://accounts.google.com/*"
   ],
   "background": {
-    "service_worker": "background.js",
+    "service_worker": "background-v1.0.10.js",
     "type": "module"
   },
+  "content_scripts": [{
+    "matches": ["https://labs.google/*", "https://flow.google.com/*"],
+    "js": ["preparation-launch.js"],
+    "run_at": "document_start"
+  }],
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' ws://127.0.0.1:* ws://localhost:*"
   },
