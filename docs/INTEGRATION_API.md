@@ -1,3 +1,62 @@
+# 图片与视频接入速查（0.2.79 文档热修，2026-10-24）
+
+## 1. 入口与收费边界
+
+本机基础地址：`http://127.0.0.1:8001`。示例不会自动执行；只有明确允许消耗积分后才能提交。
+
+| 用途 | 本机路径 | 说明 |
+| --- | --- | --- |
+| 图片或视频直接生成 | `POST /console/api/jobs` | 直接填写任务字段，不套 request 外层 |
+| 可选视频报价 | `POST /console/api/dispatch-quotes` | 仅视频，不提交生成，会核对账号与网页参数 |
+| 查询原任务 | `GET /console/api/jobs/{id}` | 不会重新生成 |
+| 查询报价绑定任务 | `GET /console/api/dispatch-quotes/{quoteId}` | 读取 jobId，避免重复提交 |
+
+局域网改用 `/api/v1/jobs`、`/api/v1/dispatch-quotes` 等对应路径，地址以页面显示为准；所有请求需 `Authorization: Bearer <密钥>`，创建任务还需 `X-Flow-Allow-Charge: yes`。本机不要求这两个请求头，但同样可能收费。
+
+## 2. 单张图片：直接提交
+
+向 `/console/api/jobs` 发送以下 JSON，先替换提示词：
+
+```json
+{"kind":"image","model":"beluga","prompt":"填写图片提示词","aspect":"16:9","count":1,"account_strategy":"round_robin","auto_retry_limit":0,"retry_uncertain":false,"retry_switch_accounts":false}
+```
+
+图片不需要先报价，不传 `dispatch_quote_id`。图片请求报价会返回422：“图片尚无本接口可核验的实时积分报价……未生成。”这是本地能力限制，不是账号异常或 Google 生成失败。
+
+**图片任务不提供 max_credits 扣费上限。** 不要向任务体添加报价专用的 `max_credits`、`asset_id`；不要默认图片免费。业务必须先核价并保证扣费封顶时，应停止提交，不得绕过报价限制。
+
+## 3. 视频：直接提交或可选报价
+
+直接向 `/console/api/jobs` 发送：
+
+```json
+{"kind":"video","video_model":"omni_flash","prompt":"填写视频提示词","duration":"4s","quality":"720p","aspect":"16:9","count":1,"account_strategy":"round_robin","auto_retry_limit":0,"retry_uncertain":false,"retry_switch_accounts":false}
+```
+
+Veo示例：`video_model` 改为 `veo_3_1_fast`，`duration` 同时改为 `8s`，保持 `720p`。不要用图片的 `model` 字段选视频模型。
+
+需要先核对视频参数与估算时，向 `/console/api/dispatch-quotes` 发送：
+
+```json
+{"request":{"kind":"video","video_model":"omni_flash","prompt":"填写视频提示词","duration":"4s","quality":"720p","aspect":"16:9","count":1,"account_strategy":"round_robin","auto_retry_limit":0,"retry_uncertain":false,"retry_switch_accounts":false},"max_credits":10,"asset_id":"your-video-001"}
+```
+
+仅接受数量1且关闭重试、切号；视频编辑模式不支持报价。10只是调用方允许的估算额度示例，不是价格承诺。成功返回 `quoteId`、`credits`、`expiresAt`；超过额度或核验失败则拒绝。
+
+确认报价后，把 `request` 内原字段原样作为 `/console/api/jobs` 请求体，增加 `dispatch_quote_id`（返回的 `quoteId`）。不要改变提示词、参数或账号。报价有有效期，只能绑定一个任务；提交响应丢失时先查询报价的 `jobId`，不要重发。
+
+**视频报价也是公开价格的保守估算，providerEnforcedCap=false，不是 Google 强制扣费封顶。** 不接受此风险时不要生成。
+
+## 4. 提交一次，只查询和下载
+
+1. HTTP202只表示入队，保存返回的 `id`。
+2. `GET /console/api/jobs/{id}` 查询；`queued`、`running` 时继续查询，不再次提交。
+3. `succeeded` 后取 `result.files[].url`，拼接基础地址后GET下载；保留URL查询参数，不猜文件名。局域网下载仍需鉴权。
+4. `failed`、`interrupted`、`canceled` 或待核对时停止自动提交，查 `error` 和原任务日志。网络超时不代表未扣费。
+5. 本机日志：`GET /console/api/jobs/{id}/work-log`；导出：`GET /console/api/jobs/{id}/work-log/export`。
+
+以下历史说明保留供参考；入口与报价边界以上述速查为准。
+
 # 0.2.39：Veo 接入
 
 通过现有任务接口提交，鉴权与扣费确认头不变：
